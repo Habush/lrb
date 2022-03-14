@@ -4,6 +4,7 @@ import numpy as np
 from scipy import sparse
 from scipy.special import expit
 from sklearn.linear_model import LogisticRegression
+from sklearn.base import BaseEstimator
 
 """
 NOTE: this python code was used in development and does not use cython. However, it is ver slow, and not up to date
@@ -17,10 +18,11 @@ except NameError:
     profile = lambda x: x
 
 
-class CDN:
+class CDN(BaseEstimator):
 
-    def __init__(self, C=1.0, beta=0.5, sigma=0.01, lower=None, upper=None, do_elimination=True):
+    def __init__(self, C=1.0, D=1.0, beta=0.5, sigma=0.01, lower=None, upper=None, do_elimination=True):
         self._C = C
+        self._D = D
         self._beta = beta
         self._sigma = sigma
         self._w = None
@@ -41,7 +43,7 @@ class CDN:
 
 
     @profile
-    def fit(self, X, y, tol=1e-5, min_epochs=2, max_epochs=200, init_w=None, verbose=0, randomize=False):
+    def fit(self, X, y, L, tol=1e-3, min_epochs=2, max_epochs=200, init_w=None, verbose=0, randomize=False, max_ls=1000):
         """
         Coordinate descent with Newton directions for L1-regularized logistic regression
         :param X: n x p feature matrix
@@ -49,12 +51,14 @@ class CDN:
         :param max_iter:
         :return:
         """
-
+        self._L = L
+        y_ = y.copy()
+        y_[y_ == 0] = -1
         n_items, n_features = X.shape
         if sparse.issparse(X):
-            yX = X.multiply(y.reshape((n_items, 1))).tocsc()
+            yX = X.multiply(y_.reshape((n_items, 1))).tocsc()
         else:
-            yX = y.reshape((n_items, 1)) * X
+            yX = y_.reshape((n_items, 1)) * X
         if init_w is None:
             self._w = np.zeros(n_features)
         else:
@@ -62,21 +66,23 @@ class CDN:
         self._v = np.zeros(n_features)
         self._active = np.ones(n_features, dtype=int)
         self._M = 0.0
-        self._R = np.sum(np.abs(self._w))
+        self._Q = self._D * self._compute_Q(self._w)
+        self._R = self._C * np.sum(np.abs(self._w))
         self._expits = 1.0 / (1.0 + np.exp(-yX.dot(self._w)))
         self._exp_nyXw = np.exp(-yX.dot(self._w))
         self._f_val = self._compute_f(self._exp_nyXw, self._w)
         self._g = self._compute_gradients(yX)
 
         for k in range(max_epochs):
-            delta, ls_steps = self._update(yX, k, randomize=randomize)
+            delta, ls_steps = self._update(yX, k, randomize=randomize, max_ls=1000)
             w_sum = np.sum(np.abs(self._w))
+            q_pen = self._compute_Q(self._w)
             if w_sum > 0:
                 rel_change = delta / w_sum
             else:
                 rel_change = 0.0
             if verbose > 1:
-                print("epoch %d, delta=%0.5f, rel_change=%0.5f, ls_steps=%d" % (k, delta, rel_change, ls_steps))
+                print("epoch %d, delta=%0.5f, rel_change=%0.5f, ls_steps=%d, q_pen=%.3f" % (k, delta, rel_change, ls_steps, q_pen))
             if rel_change < tol and k >= min_epochs - 1:
                 if verbose > 0:
                     print("relative change below tolerance; stoppping after %d epochs" % k)
@@ -93,8 +99,12 @@ class CDN:
         probs[:, 0] = 1.0 - prob_pos
         return probs
 
+    def get_params(self, deep=True):
+        return {"C": self._C, "beta": self._beta, "sigma": self._sigma, "lower": self._lower,
+                "upper": self._upper, "do_elimination": self._do_elimination}
+
     @profile
-    def _update(self, yX, k, randomize=False):
+    def _update(self, yX, k, randomize=False, max_ls=1000):
         n_items, n_features = yX.shape
         running_abs_change = 0
         running_ls_steps = 0
@@ -103,7 +113,7 @@ class CDN:
             np.random.shuffle(order)
         for j in order:
             if self._active[j]:
-                change, ls_steps = self._update_one_coordinate(yX, j)
+                change, ls_steps = self._update_one_coordinate(yX, j, max_ls=1000)
                 running_abs_change += np.abs(change)
                 running_ls_steps += ls_steps
         # update the threshold for eliminating variables on the next iteration
@@ -113,7 +123,7 @@ class CDN:
         return running_abs_change, running_ls_steps
 
     @profile
-    def _update_one_coordinate(self, yX, j):
+    def _update_one_coordinate(self, yX, j, max_ls=1000):
         n_items, n_features = yX.shape
 
         #h = self._compute_hessian_element(yX[:, j])
@@ -123,9 +133,8 @@ class CDN:
         else:
             yX_j = yX[:, j]
 
-        g = self._compute_grad_j(yX_j)
-        h = self._compute_hessian_element(yX_j)
-
+        g = self._compute_grad_j(yX_j, j)
+        h = self._compute_hessian_element(yX_j, j)
         if self._do_elimination:
             # start testing for feature elimination on the second epoch
             if self._M > 0:
@@ -168,16 +177,22 @@ class CDN:
         i = 0
         if a > 0:
             # set up the threshold for convergence
-            thresh = self._sigma * (g * d + np.abs(self._w[j] + d) - np.abs(self._w[j]))
+            thresh = self._sigma * (g * d + self._C * np.abs(self._w[j] + d) - self._C * np.abs(self._w[j]))
+            # remove the current weight from the stored quadratic form
+            w_c = self.get_w()
+            w_c[j] = 0
+            Q_minus_w_j = self._Q - self._D * self._compute_Q(w_c)
             # remove the current weight from the stored 1-norm of weights
-            R_minus_w_j = self._R - np.abs(self._w[j])
+            R_minus_w_j = self._R - self._C * np.abs(self._w[j])
             # do line search
-            f_new, a, i, exp_nyXw = self._line_search(yX_j, d, self._w[j], R_minus_w_j, a, thresh)
+            f_new, a, i, exp_nyXw = self._line_search(yX_j, d, self._w[j], Q_minus_w_j, R_minus_w_j, a, thresh, j, max_ls=1000)
             # store the updated values
             self._f_val = f_new
             self._w[j] += a * d
             # add the 1-norm of the new weight back into the stored sum
-            self._R = R_minus_w_j + np.abs(self._w[j])
+            self._R = R_minus_w_j + self._C * np.abs(self._w[j])
+            w_c[j] = self._w[j]
+            self._Q = Q_minus_w_j + self._D * self._compute_Q(w_c)
             self._exp_nyXw = exp_nyXw
             # recompute the stored probabilities and gradient
             self._expits = self._compute_probs(yX)
@@ -186,7 +201,7 @@ class CDN:
         return a * d, i
 
     @profile
-    def _line_search(self, yX_j, d, prev_w_j, base_R, a, thresh):
+    def _line_search(self, yX_j, d, prev_w_j, base_Q, base_R, a, thresh, j, max_ls=1000):
         i = 0
         n_items = len(self._exp_nyXw)
         step = a * d
@@ -203,10 +218,13 @@ class CDN:
         else:
             exp_nyXw = self._exp_nyXw * np.exp(-step * yX_j)
 
+        w_c = np.zeros(len(self._w))
+        w_c[j] = w_j
         L = self._compute_L(exp_nyXw)
-        R = base_R + np.abs(w_j)
-        f_new = L + R
-        while f_new - self._f_val > a * thresh:
+        Q = base_Q + self._D * self._compute_Q(w_c)
+        R = base_R + self._C * np.abs(w_j)
+        f_new = L + Q + R
+        while f_new - self._f_val > a * thresh and i < max_ls:
             a *= self._beta
             step = a * d
             w_j = prev_w_j + step
@@ -219,8 +237,10 @@ class CDN:
                 exp_nyXw = self._exp_nyXw * np.exp(-step * yX_j)
 
             L = self._compute_L(exp_nyXw)
-            R = base_R + np.abs(w_j)
-            f_new = L + R
+            w_c[j] = w_j
+            Q = base_Q + self._D * self._compute_Q(w_c)
+            R = base_R + self._C * np.abs(w_j)
+            f_new = L + Q + R
             i += 1
         return f_new, a, i, exp_nyXw
 
@@ -230,31 +250,36 @@ class CDN:
 
     @profile
     def _compute_f(self, exp_nyXw, w):
-        return self._compute_L(exp_nyXw) + self._compute_R(w)
+        return self._compute_L(exp_nyXw) + self._D * self._compute_Q(w) + self._C * self._compute_R(w)
 
     @profile
     def _compute_L(self, exp_nyXw):
-        return self._C * np.sum(np.log(1.0 + exp_nyXw))
+        return np.sum(np.log(1.0 + exp_nyXw))
 
     @profile
     def _compute_R(self, w):
-        return np.sum(np.abs(w))
+        return self._C * np.sum(np.abs(w))
+
+    @profile
+    def _compute_Q(self, w):
+        return w.T @ self._L @ w
 
     @profile
     def _compute_gradients(self, yX):
-        return self._C * yX.T.dot(self._expits - 1.0)
+        return (yX.T.dot(self._expits - 1.0)) + self._D * (2 * (self._L @ self._w))
 
     @profile
-    def _compute_grad_j(self, yX_j):
-        return self._C * yX_j.dot(self._expits - 1.0)
+    def _compute_grad_j(self, yX_j, j):
+        grad_b = 2 * (self._L[j] @ self._w)
+        return (yX_j.dot(self._expits - 1.0)) + self._D * grad_b
 
     @profile
-    def _compute_hessian_element(self, yX_j):
+    def _compute_hessian_element(self, yX_j, j):
         if sparse.issparse(yX_j):
             # This is kind of slow, unless very sparse; probably better to pass in a dense vector
-            return self._C * yX_j.T.power(2).multiply(self._expits * (1.0 - self._expits)).sum()
+            return yX_j.T.power(2).multiply(self._expits * (1.0 - self._expits)).sum()
         else:
-            return self._C * np.sum(yX_j ** 2 * self._expits * (1.0 - self._expits))
+            return (np.sum(yX_j ** 2 * self._expits * (1.0 - self._expits))) + self._D * 2 * self._L[j, j]
 
     def get_w(self):
         return self._w.copy()
